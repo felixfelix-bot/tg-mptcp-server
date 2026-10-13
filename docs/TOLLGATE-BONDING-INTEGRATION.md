@@ -1,5 +1,11 @@
 # Multi-WAN bonding + TollGate — integration evaluation and demo design
 
+> **Redaction note.** This document deliberately refers to the de-aggregation
+> host as `<mptcp-server-host>` instead of its real address. The repository is
+> public and naming a live listener's host, port and cipher advertises an
+> unnecessary brute-force target. The technique is unchanged; only the
+> deployment specifics are withheld. Supply your own endpoint locally.
+
 Status: evaluation written from live verification (2026-10-13). Server side is
 **verified working**. Router side is **staged and blocked on hardware access**
 (see §6).
@@ -13,10 +19,10 @@ Every claim below is either marked **[verified]** (I observed it) or
 
 | Component | State | Evidence |
 |---|---|---|
-| tg-mptcp-server on vps2 `23.182.128.51` | **live** | `ss-server -c /etc/shadowsocks-libev/config.json --mptcp` (pid 818), listening `0.0.0.0:65101`; config: chacha20-ietf-poly1305, `tcp_and_udp`, `fast_open` |
+| tg-mptcp-server on vps2 `<mptcp-server-host>` | **live** | an `ss-server --mptcp` listener on a non-default port; cipher chacha20-ietf-poly1305, `tcp_and_udp`, `fast_open` |
 | vps2 kernel MPTCP | **on** | kernel `6.12.111+deb13-amd64`, `CONFIG_MPTCP=y`, `net.mptcp.enabled=1` |
-| Client → server MPTCP | **verified** | from x280: `ss-local --mptcp -l 1080` → vps2:65101; `ss -Mti` shows the connection carrying `tcp-ulp-mptcp` with a negotiated token (`token:0000(id:0)/6062ec55(id:0)`), `subflows_max:2`; egress IP = `23.182.128.51` |
-| Two-path subflow mechanism | **verified** | from cobrador (dual-homed: house ethernet + MT6000 guest wifi), MPTCP endpoints present on both interfaces (`ip mptcp endpoint show` → 2 endpoints, `subflows 2`), connection tokens negotiated on :65101 |
+| Client → server MPTCP | **verified** | from x280: `ss-local --mptcp -l 1080` → vps2<port>; `ss -Mti` shows the connection carrying `tcp-ulp-mptcp` with a negotiated token (`token:0000(id:0)/6062ec55(id:0)`), `subflows_max:2`; egress IP = `<mptcp-server-host>` |
+| Two-path subflow mechanism | **verified** | from cobrador (dual-homed: house ethernet + MT6000 guest wifi), MPTCP endpoints present on both interfaces (`ip mptcp endpoint show` → 2 endpoints, `subflows 2`), connection tokens negotiated on <port> |
 | MT6000 kernel MPTCP | **on** | `tollgate-VIL4`, OpenWrt 25.12.5 r33051, kernel 6.12.94, `net.mptcp.enabled=1` (read over serial root shell) |
 | MT6000 MPTCP client tooling | **missing** | BusyBox `ip` (no `ip mptcp` subcommand), no `ss`, no `mptcpize`, `/etc/apk/repositories` empty → no internet to install |
 
@@ -43,7 +49,7 @@ TollGate router (MT6000, OpenWrt)
    ├── ip mptcp endpoint add <addr> subflow dev <wan2> │  one per uplink
    └── ip mptcp limits set subflow 2                   ┘
                                                        │
-VPS (tg-mptcp-server): ss-server --mptcp :65101 ──► NAT ──► internet
+VPS (tg-mptcp-server): ss-server --mptcp <port> ──► NAT ──► internet
 ```
 
 Required, in order:
@@ -112,7 +118,7 @@ running MTU discovery rather than assuming 1500.
 **Server: done.** The Ansible playbook (`roles/mptcp_server`) deploys
 `ss-server --mptcp` under a systemd override, enables the MPTCP sysctls
 (`roles/base`), and sets `ip mptcp limits` via a `mptcp-limits.service`. It is
-deployed and **verified live on vps2** (§1). Ports: 65101 (shadowsocks TCP+UDP),
+deployed and **verified live on vps2** (§1). Ports: a non-default port (shadowsocks TCP+UDP),
 65001 (glorytun, UDP aggregation).
 
 **Client (router) steps — staged, needs the router online:**
@@ -128,7 +134,7 @@ ip mptcp endpoint add <wan1-ip> subflow dev <wan1-iface>
 ip mptcp endpoint add <wwan-ip> subflow dev <wwan-iface>
 
 # 3. MPTCP-aware redirect proxy to the VPS
-ss-redir -s 23.182.128.51 -p 65101 -l 1080 -k <pw> -m chacha20-ietf-poly1305 --mptcp
+ss-redir -s <mptcp-server-host> -p <port> -l 1080 -k <pw> -m chacha20-ietf-poly1305 --mptcp
 
 # 4. steer traffic into it (nftables tproxy/REDIRECT) — collision warning in §5
 ```
