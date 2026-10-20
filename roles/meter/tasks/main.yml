@@ -37,12 +37,14 @@
       - meter_proxy_port | int > 0
       - meter_payment_port | int > 0
       - meter_family in ['ip', 'inet']
-      - meter_default_verdict == 'drop'
+      - meter_default_verdict == 'accept'
     fail_msg: >-
       Meter configuration is incoherent: table={{ meter_table }} proxy_port={{ meter_proxy_port }}
       payment_port={{ meter_payment_port }} family={{ meter_family }}
-      default_verdict={{ meter_default_verdict }}. A metered chain MUST be default-deny
-      (meter_default_verdict=drop) and the ports MUST be set.
+      default_verdict={{ meter_default_verdict }}. The chain policy MUST be `accept` with the drop
+      INSIDE the metered rule: a drop-policy chain at this hook hijacks every co-located service
+      the table does not name (measured: it killed the host's ss-server on :65101 and SSH on
+      :2222). The ports MUST be set.
 
 - name: Meter | Install nftables
   ansible.builtin.apt:
@@ -91,10 +93,15 @@
 - name: Meter | Apply the meter table atomically
   ansible.builtin.command:
     cmd: "nft -f {{ meter_state_dir }}/tg-meter-swap.nft"
+  # Honest `changed`: the swap ALWAYS runs (it is a delete+recreate, so there is no file diff to
+  # compare), therefore report changed only when the shape actually differs from what is live.
+  # Counting RULE lines, not the word `accept` -- the chain header carries `policy accept` too, so
+  # a naive count is off by one per chain and the comparison never converges.
   changed_when: >-
     meter_live_before.rc != 0 or
     meter_rendered.changed or
-    (meter_live_before.stdout | regex_findall('accept') | length) != meter_expected_uplink_accepts | int + meter_expected_downlink_accepts | int
+    (meter_live_before.stdout.splitlines() | select('search', ' accept$') | reject('search', 'policy') | list | length) !=
+    (meter_expected_uplink_accepts | int + meter_expected_downlink_accepts | int)
   register: meter_apply
 
 # --- Persist the table across reboot (counters do NOT survive; the shape must) ---
@@ -137,19 +144,49 @@
   changed_when: false
   register: meter_downlink_readback
 
+# Count RULE lines (not the chain header, which also carries the word `accept` as the policy).
+# This is the value the duplicate guard compares against the expected shape.
+- name: Meter | Count the metered rules actually present
+  ansible.builtin.shell:
+    cmd: >-
+      printf '%s\n' "{{ meter_uplink_readback.stdout }}" | grep -E ' accept$' | grep -vc policy || true
+  changed_when: false
+  register: _meter_ul_count
+
+- name: Meter | Count the metered rules actually present (downlink)
+  ansible.builtin.shell:
+    cmd: >-
+      printf '%s\n' "{{ meter_downlink_readback.stdout }}" | grep -E ' accept$' | grep -vc policy || true
+  changed_when: false
+  register: _meter_dl_count
+
+- name: Meter | Record the observed rule counts
+  ansible.builtin.set_fact:
+    meter_uplink_rule_count: "{{ _meter_ul_count.stdout | trim }}"
+    meter_downlink_rule_count: "{{ _meter_dl_count.stdout | trim }}"
+
 # --- THE BOOBY-TRAP GUARD ---
 #
 # These asserts are the whole reason this work package exists. Each one closes a failure that
 # is invisible in a passing test: the table can be present, the service "active", every other
-# check green, and the meter still bill nothing or bill the wrong side.
-- name: Meter | Guard - both metered chains must be default-deny
+# check green, and the meter still bill nothing, bill the wrong side, or kill the host.
+#
+# NOTE ON THE FIRST VERSION OF THIS GUARD, which asserted `policy drop`: that assert was WRONG and
+# actively harmful. A filter chain hooked at `input` with a drop policy hijacks every co-located
+# service it does not name — measured on the target, it took down the host's `ss-server` on :65101
+# (live since Oct 3) and SSH on :2222, despite the pre-existing ufw ruleset explicitly accepting
+# both. The guard now asserts the CORRECT shape: chain policy `accept`, with the drop INSIDE the
+# metered rule, so the meter polices its own clients and leaves other services alone.
+- name: Meter | Guard - the chains must NOT be default-deny (a drop policy hijacks the host)
   ansible.builtin.assert:
     that:
-      - "'policy drop' in meter_uplink_readback.stdout"
-      - "'policy drop' in meter_downlink_readback.stdout"
+      - "'policy accept' in meter_uplink_readback.stdout"
+      - "'policy accept' in meter_downlink_readback.stdout"
     fail_msg: >-
-      A metered chain is NOT default-deny. An accept-policy metered chain delivers over-quota
-      traffic and is a free tunnel, while looking healthy. Uplink: {{ meter_uplink_readback.stdout }}
+      A metered chain is default-DENY. On a host that runs other services this silently hijacks
+      them: a filter chain at this hook with a drop policy drops everything it is not told to
+      accept, so every co-located service dies while this table reports nothing. The drop belongs
+      INSIDE the metered rule. Uplink: {{ meter_uplink_readback.stdout }}
       Downlink: {{ meter_downlink_readback.stdout }}
 
 - name: Meter | Guard - the metered rules must carry an explicit terminal drop
@@ -165,6 +202,38 @@
   # a correctly-empty WP1 for the right reason at the wrong time.
   when: meter_client_objects | length > 0
 
+# --- THE SHARED-HOST SAFETY GUARD ---
+#
+# This is the check the FIRST version of this role lacked, and its absence caused an incident: a
+# `policy drop` chain at this hook silently took down co-located services (the host's `ss-server`
+# on :65101 and SSH on :2222) that the pre-existing ruleset had open. A shape guard cannot catch
+# that, because the failing thing is not one of this role's own rules — it is a rule that is
+# ABSENT. So this guard asserts the property directly, from the node: every co-located port listed
+# in `meter_protected_ports` must still accept a connection after we apply.
+#
+# An empty `meter_protected_ports` means "skip" (a dedicated bonding box needs no guard).
+- name: Meter | Probe the protected co-located ports through the live ruleset
+  ansible.builtin.wait_for:
+    host: "{{ meter_probe_host | default('127.0.0.1') }}"
+    port: "{{ item }}"
+    timeout: "{{ meter_probe_timeout | default(3) }}"
+    state: started
+  loop: "{{ meter_protected_ports | default([]) }}"
+  register: meter_port_probe
+  ignore_errors: true
+  changed_when: false
+
+- name: Meter | Guard - no co-located service may have been killed by this table
+  ansible.builtin.assert:
+    that:
+      - meter_port_probe.results | default([]) | selectattr('failed', 'defined') | selectattr('failed') | list | length == 0
+    fail_msg: >-
+      Applying the meter KILLED a co-located service. This is the incident this guard exists for: a
+      chain hooked at `input` with `policy drop` drops everything it is not told to accept, so every
+      other service on the host dies while this table reports nothing and its own shape guards pass.
+      The drop belongs INSIDE the metered rule, with the chain policy left at `accept`.
+  when: meter_protected_ports | default([]) | length > 0
+
 - name: Meter | Report when no per-client objects are provisioned yet
   ansible.builtin.debug:
     msg: >-
@@ -176,18 +245,19 @@
 - name: Meter | Guard - the metered chains must not accumulate duplicate rules
   ansible.builtin.assert:
     that:
-      - meter_uplink_readback.stdout | regex_findall('accept') | length == meter_expected_uplink_accepts | int
-      - meter_downlink_readback.stdout | regex_findall('accept') | length == meter_expected_downlink_accepts | int
+      # Count RULE lines only. A chain header contains the word `accept` too (the policy), so a
+      # naive `grep -c accept` over the chain listing is off by one and would drift with any
+      # unrelated edit. Counting lines that begin with an address/port match is stable.
+      - meter_uplink_rule_count | int == meter_expected_uplink_accepts | int
+      - meter_downlink_rule_count | int == meter_expected_downlink_accepts | int
     fail_msg: >-
       The meter table has accumulated duplicate rules. `nft -f` on an existing table APPENDS
       rather than replaces, so a repeated apply silently multiplies every rule while the playbook
       still reports changed=0 and every other guard still passes (they check for presence, not for
       absence of duplicates). Measured once: 24 accept rules where 4 belong.
-      uplink accept count = {{ meter_uplink_readback.stdout | regex_findall('accept') | length }}
-      (expected {{ meter_expected_uplink_accepts }})
-      downlink accept count = {{ meter_downlink_readback.stdout | regex_findall('accept') | length }}
-      (expected {{ meter_expected_downlink_accepts }})
-      The fix is the atomic delete-then-recreate in tg-meter-swap.nft.j2, not a flush.
+      uplink rules = {{ meter_uplink_rule_count }} (expected {{ meter_expected_uplink_accepts }})
+      downlink rules = {{ meter_downlink_rule_count }} (expected {{ meter_expected_downlink_accepts }})
+      The fix is the add/delete/recreate swap in tg-meter-swap.nft.j2, not a flush.
 
 - name: Meter | Guard - a metered rule must never name an egress interface
   ansible.builtin.assert:

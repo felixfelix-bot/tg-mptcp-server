@@ -78,9 +78,10 @@ meter_downlink_chain: "downlink"
 
 # Must be 'drop'. Asserted in roles/meter/tasks/main.yml — a metered chain that is not
 # default-deny is a free tunnel, so this is not offered as a choice.
-meter_default_verdict: "drop"
+meter_default_verdict: "accept"
 
 # The proxied data path (the metered leg) and the payment surface (never gated).
+meter_dns_port: 53
 meter_proxy_port: 65101
 meter_payment_port: 2121
 
@@ -116,5 +117,19 @@ meter_grace_bytes: 262144
 # + 2 payment rules (tcp+udp on meter_payment_port, always present).
 # The guard exists because `nft -f` APPENDS to an existing table, so a repeated apply multiplies
 # every rule while the playbook reports changed=0 and presence-based guards still pass.
-meter_expected_uplink_accepts: 4
-meter_expected_downlink_accepts: 4
+meter_expected_uplink_accepts: 6
+meter_expected_downlink_accepts: 6
+
+# Co-located service ports that MUST survive this role. This is the shared-host safety guard.
+#
+# The FIRST version of this role set `policy drop` on an `input`-hooked chain. That silently killed
+# the host's `ss-server` on :65101 (live since Oct 3) and SSH on :2222, even though the pre-existing
+# ufw ruleset explicitly accepts both — a drop-policy chain at the same hook drops everything it is
+# not told to accept. Measured, then fixed by moving the drop INSIDE the metered rule and leaving
+# the chain policy at `accept`.
+#
+# Every port listed here is probed after the apply, from the node. A dead port fails the play.
+# Set to [] on a dedicated box where hijacking cannot matter.
+meter_protected_ports: [2222, 65101, 2121]
+meter_probe_host: "127.0.0.1"
+meter_probe_timeout: 3

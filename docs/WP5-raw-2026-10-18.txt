@@ -1,0 +1,33 @@
+=== WP5 meter accuracy harness ===
+host testserver2  kernel 6.12.113+deb13-amd64  nft v1.1.3
+table=tgmeter client=10.99.0.5 budget=1048576 payload=262144 tolerance=2%
+
+--- 0. shape gate (a bad shape makes every number below meaningless) ---
+{"ok": true, "problems": []}
+  shape OK
+
+--- 1. provision client at a generous budget ---
+  counter at start: 0 bytes
+
+--- 2. GOLDEN case: exactly 262144 bytes, no budget pressure ---
+  pushed=262144  counter_saw=262568
+  GOLDEN DEVIATION: counter=262568 vs pushed=262144 (delta 424)
+  NOT aborting: the loopback probe has no MTU/header overhead, so a non-zero delta means the
+  counting path added bytes that were not payload. Recorded, but the priced path is separate.
+
+--- 3. pricing arithmetic ---
+  billed_bytes=262568  bytes_per_sat=1048576
+  sats_due=0  remainder=262568 bytes (25.04% of one sat carried forward)
+  NOTE: the remainder is NOT lost -- it persists because the counter is monotonic and
+  billing divides cumulative bytes, not per-tick deltas. A per-tick floor division WOULD
+  lose up to 1 sat per tick per client, which at 1 Hz is 86400 sats/day.
+
+--- 4. overcharge check: bill the counter, not quota.used ---
+  delivered(counter)=0  quota_used=0
+  quota.used <= counter (no overcharge observed in this run)
+
+--- 5. cleanup ---
+  test client objects removed; the ceiling and other clients untouched
+  tables now: table ip filter table ip6 filter table inet fips table inet fips-exit table ip nat table ip6 nat table ip raw table inet f2b-table table ip tgmeter 
+
+RAW: /home/c08r4d0r/reports/mptcp-loop/wp5-accuracy.txt

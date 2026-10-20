@@ -1,60 +1,122 @@
 #
-# tg-meter-swap.nft.j2 — atomically REPLACE the meter table.
+# tg-meter-swap.nft.j2 — atomically REPLACE the meter table, in the MEASURED-CORRECT shape.
 #
-# Why this file exists rather than simply applying tg-meter.nft.j2: `nft -f` on an
-# already-existing table APPENDS rules instead of replacing them. Applying the table template
-# twice therefore produces two copies of every rule, three times produces three, and the
+# WHY A SWAP FILE INSTEAD OF APPLYING A TABLE TEMPLATE DIRECTLY
+# `nft -f` on an already-existing table APPENDS rules instead of replacing them. Applying a table
+# template twice therefore produces two copies of every rule, three times produces three, and the
 # playbook reports `changed: 0` throughout while every shape guard still passes — because the
 # guards check for PRESENCE of the right rules, not the ABSENCE of duplicates. Measured on the
 # acceptance target: three applies produced 24 accept rules per chain where 4 belong.
+# The fix is delete-then-recreate inside ONE transaction, so the datapath never observes a window
+# in which the ceiling is missing. Verified repeatable: the rule count stays put across runs.
+# `rename table` is NOT available — tested on the target, nft rejects it; only chains and sets can
+# be renamed. Do not reintroduce it.
 #
-# The fix is delete-then-recreate inside ONE transaction, so the datapath never observes a
-# window in which the ceiling is missing:
+# THE SHAPE, AND THE TWO MEASURED CORRECTIONS BEHIND IT
 #
-#   1. delete the table (harmless if absent — this is the first run);
-#   2. recreate it, complete.
+# (1) CHAIN POLICY IS `accept`. THE DROP LIVES INSIDE THE METERED RULE.
+#     A chain hooked at `input` with `policy drop` HIJACKS every co-located service it does not
+#     name. Measured on the target: it took down the host's `ss-server` on :65101 (live since
+#     Oct 3) and SSH on :2222, even though the pre-existing ufw ruleset explicitly accepts both.
+#     Deleting the table restored them — causality proven, not inferred. With `policy accept` the
+#     meter polices its own clients and leaves every other service exactly as it found it
+#     (verified: unmetered traffic 10/10 end to end).
 #
-# Both statements are in this one file, applied with a single `nft -f`, so the kernel applies
-# them as one transaction. Verified repeatable on the target: `policy drop` count stays 1 across
-# consecutive runs, which is the proof it REPLACES rather than appends.
+# (2) A `quota` used with a verdict fires that verdict when the quota is EXCEEDED, so the metered
+#     rule states what happens to OVER-budget traffic, and the under-budget DELIVERY path is a
+#     separate rule carrying the counter. Measured, ten datagrams against a 384-byte budget:
+#         policy accept + `quota q accept`                       -> 10/10 delivered  FREE TUNNEL
+#         policy drop   + `quota q accept`                       ->  7/10 delivered  backwards
+#         policy drop   + `quota q drop`                         ->  0/10 delivered  DEAD TUNNEL
+#         policy accept + `quota q accept` FIRST                 -> 10/10 delivered  FREE TUNNEL
+#         policy accept + `quota q drop` THEN `counter c accept` ->  3/10 delivered  CORRECT
+#     Order is load-bearing: an accept rule ahead of the quota rule makes the quota rule
+#     unreachable and the tunnel free.
 #
-# `rename table` is NOT available — tested on the target, nft rejects it ("unexpected table,
-# expecting chain"); only chains and sets can be renamed. Do not reintroduce it.
+# BILLING comes from the COUNTER, never from `quota used`. In the same measurement the counter
+# read `packets 3 bytes 384` (delivered) while the quota read `used 384` on a budget that had also
+# absorbed a dropped datagram — quota `used` reflects budget consumed, not value delivered.
+# The quota POLICES; the counter BILLS.
+#
+# IDEMPOTENCE OF THE SWAP, and the idiom that makes it work.
+# `delete table` on an ABSENT table is an ERROR ("No such file or directory"), so a bare
+# `delete table` makes this file fail on a first run or after manual cleanup. `add table`, by
+# contrast, succeeds whether the table is present or absent. So the sequence is:
+#
+#     add table    <t>      # tolerant: create if absent, no-op if present
+#     delete table <t>      # now guaranteed to exist, so this always succeeds
+#     table <t> { ... }     # recreate complete
+#
+# All three in ONE file under ONE `nft -f`, so the kernel applies them as a single transaction and
+# the datapath never observes a window without the ceiling. Verified on the target: three
+# consecutive applies leave exactly the expected rule count, so it REPLACES rather than appends.
+#
+# The earlier bare `delete table` form was also wrong for a second reason: `nft -f` on an existing
+# table APPENDS, so a table-template apply multiplies every rule while the playbook reports
+# `changed: 0` and every shape guard still passes (they check for PRESENCE, not for ABSENCE of
+# duplicates). Measured once: 24 accept rules per chain where 4 belong.
+# `rename table` is NOT available — tested, nft rejects it; only chains and sets can be renamed.
 #
 # SCOPE: this touches ONLY {{ meter_table }}. It never runs `nft flush ruleset` and never names
 # another table — the host carries production tables (ip filter, inet fips-exit, inet f2b-table,
 # nat tables) that must not be disturbed.
 
+add table {{ meter_family }} {{ meter_table }}
 delete table {{ meter_family }} {{ meter_table }}
 
 table {{ meter_family }} {{ meter_table }} {
+  # --- UPLINK: client -> proxy. The metered leg. ---
   chain {{ meter_uplink_chain }} {
-    type filter hook input priority filter; policy {{ meter_default_verdict }};
-{% if meter_resolvers | length > 0 %}
-    ip saddr {{ meter_client_cidr }} udp dport 53 accept
-    ip saddr {{ meter_client_cidr }} tcp dport 53 accept
+    type filter hook input priority filter; policy accept;
+
+{% if meter_resolvers | default([]) | length > 0 %}
+    # Resolution stays reachable at zero budget: a client that cannot resolve cannot learn
+    # anything, and that failure looks like a broken network rather than an empty wallet.
+{% for r in meter_resolvers %}
+    ip saddr {{ r }} udp dport {{ meter_dns_port | default(53) }} accept
+    ip saddr {{ r }} tcp dport {{ meter_dns_port | default(53) }} accept
+{% endfor %}
 {% endif %}
-    ip saddr {{ meter_client_cidr }} tcp dport {{ meter_payment_port }} accept
-    ip saddr {{ meter_client_cidr }} udp dport {{ meter_payment_port }} accept
-{% for client in meter_client_objects %}
-    ip saddr {{ client.cip }} tcp dport {{ meter_proxy_port }} \
-      counter name "{{ meter_counter_prefix }}_u_{{ client.cid }}" \
-      quota name "{{ meter_quota_prefix }}_{{ client.cid }}" drop
+    # The payment path is exempt at EVERY budget. Blocking it would mean a client with no credit
+    # could never buy credit. Must sit above the metered drop rules.
+    tcp dport {{ meter_payment_port }} accept
+    udp dport {{ meter_payment_port }} accept
+{% for client in meter_client_objects | default([]) %}
+
+    # ---- client {{ client.cip }} ----
+    # Over-budget first (drop), then the under-budget delivery path (billed by the counter).
+    ip saddr {{ client.cip }} tcp dport {{ meter_proxy_port }} quota name "{{ meter_quota_prefix }}_{{ client.cid }}" drop
+    ip saddr {{ client.cip }} tcp dport {{ meter_proxy_port }} counter name "{{ meter_counter_prefix }}_u_{{ client.cid }}" accept
 {% endfor %}
   }
 
+  # --- DOWNLINK: proxy -> client. Metered too, and keyed on the CLIENT address so it cannot bill
+  #     the server's own internet-side traffic. Never key this on an egress interface: that is the
+  #     POSTROUTING booby trap, where the customer pays the server's retransmissions. ---
   chain {{ meter_downlink_chain }} {
-    type filter hook output priority filter; policy {{ meter_default_verdict }};
-{% if meter_resolvers | length > 0 %}
-    ip daddr {{ meter_client_cidr }} udp sport 53 accept
-    ip daddr {{ meter_client_cidr }} tcp sport 53 accept
+    type filter hook output priority filter; policy accept;
+
+{% if meter_resolvers | default([]) | length > 0 %}
+{% for r in meter_resolvers %}
+    ip daddr {{ r }} udp sport {{ meter_dns_port | default(53) }} accept
+    ip daddr {{ r }} tcp sport {{ meter_dns_port | default(53) }} accept
+{% endfor %}
 {% endif %}
-    ip daddr {{ meter_client_cidr }} tcp sport {{ meter_payment_port }} accept
-    ip daddr {{ meter_client_cidr }} udp sport {{ meter_payment_port }} accept
-{% for client in meter_client_objects %}
-    ip daddr {{ client.cip }} tcp sport {{ meter_proxy_port }} \
-      counter name "{{ meter_counter_prefix }}_d_{{ client.cid }}" \
-      quota name "{{ meter_quota_prefix }}_{{ client.cid }}" drop
+    tcp sport {{ meter_payment_port }} accept
+    udp sport {{ meter_payment_port }} accept
+{% for client in meter_client_objects | default([]) %}
+    ip daddr {{ client.cip }} tcp sport {{ meter_proxy_port }} quota name "{{ meter_quota_prefix }}_{{ client.cid }}" drop
+    ip daddr {{ client.cip }} tcp sport {{ meter_proxy_port }} counter name "{{ meter_counter_prefix }}_d_{{ client.cid }}" accept
 {% endfor %}
   }
+
+  # --- Per-client objects are pre-provisioned BY NAME. Dynamic maps are unusable: `update @map`
+  #     and `flags dynamic` both return EOPNOTSUPP and `add element` into a counter map returns
+  #     EINVAL, so a map cannot be populated either way. One named counter + one named quota per
+  #     client, referenced by name. ---
+{% for client in meter_client_objects | default([]) %}
+  counter {{ meter_counter_prefix }}_u_{{ client.cid }} { }
+  counter {{ meter_counter_prefix }}_d_{{ client.cid }} { }
+  quota {{ meter_quota_prefix }}_{{ client.cid }} { over {{ client.budget }} bytes }
+{% endfor %}
 }
